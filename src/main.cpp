@@ -2,11 +2,11 @@
 #include "Free_Fonts.h"
 #include <Wire.h>
 #include <DFRobot_SHT20.h>
+#include <SparkFun_SCD30_Arduino_Library.h>
+#include "Adafruit_SGP30.h"
 #include <WiFi.h>
 #include <PubSubClient.h>  // MQTT library
 
-float temp = 0.0;
-float humd = 0.0;
 
 // Define a struct to hold PM and particle data
 struct PMData {
@@ -26,10 +26,26 @@ struct PMData {
     uint16_t reserved;
     uint16_t checksum;
 };
-
 PMData pmData;  // Create an instance of PMData
 
+//Same for SGP30 air sensor data
+struct AirQData {
+    uint16_t ethanol;
+    uint16_t hydrogen;
+    uint16_t eCo2;
+};
+AirQData airQData;
+
+float temp = 0.0;
+float humd = 0.0;
+float co2Level = 0.0;
+int ilumLevel=0;
+
 DFRobot_SHT20 sht20;
+SCD30 co2Sensor;
+Adafruit_SGP30 airSensor;
+#define TSL_MEASURMENT_PERIOD_US 100000
+
 
 #define TFT_GREY 0x7BEF
 
@@ -145,7 +161,7 @@ void displayPMandParticleValues() {
 
     M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
     M5.Lcd.setCursor(X_LOCAL, Y_LOCAL + Y_OFFSET * 6, FONT_SIZE);
-    M5.Lcd.printf("0.3um : %d", pmData.particles_0_3um);
+    M5.Lcd.printf("0.3um : %u", pmData.particles_0_3um);
 
     M5.Lcd.setCursor(X_LOCAL, Y_LOCAL + Y_OFFSET * 7, FONT_SIZE);
     M5.Lcd.printf("0.5um : %d", pmData.particles_0_5um);
@@ -195,7 +211,7 @@ bool verifyChecksum(const uint8_t *data, uint16_t len) {
 void readTempHumidity() {
     temp = sht20.readTemperature();
     humd = sht20.readHumidity();
-
+    
     M5.Lcd.setTextColor(TFT_GREEN, TFT_BLACK);
     M5.Lcd.setCursor(X_LOCAL, Y_LOCAL + Y_OFFSET * 10, FONT_SIZE);
     M5.Lcd.printf("Temp : %.2f C", temp);
@@ -231,7 +247,6 @@ void sendMQTTData() {
     // Publish particle number data
     snprintf(valueStr, sizeof(valueStr), "%d", pmData.particles_0_3um);
     client.publish("home/sensor/m5stack/particles_0_3um", valueStr);
-    Serial.print(valueStr);
 
     snprintf(valueStr, sizeof(valueStr), "%d", pmData.particles_0_5um);
     client.publish("home/sensor/m5stack/particles_0_5um", valueStr);
@@ -247,6 +262,23 @@ void sendMQTTData() {
 
     snprintf(valueStr, sizeof(valueStr), "%d", pmData.particles_10um);
     client.publish("home/sensor/m5stack/particles_10um", valueStr);
+
+    snprintf(valueStr, sizeof(valueStr), "%f", co2Level);
+    client.publish("home/sensor/m5stack/co2Level", valueStr);
+
+    snprintf(valueStr, sizeof(valueStr), "%d", airQData.ethanol);
+    client.publish("home/sensor/m5stack/ethanol", valueStr);
+
+    snprintf(valueStr, sizeof(valueStr), "%d", airQData.hydrogen);
+    client.publish("home/sensor/m5stack/hydrogen", valueStr);
+
+    snprintf(valueStr, sizeof(valueStr), "%d", airQData.eCo2);
+    client.publish("home/sensor/m5stack/eCO2", valueStr);
+
+    snprintf(valueStr, sizeof(valueStr), "%d", ilumLevel);
+    client.publish("home/sensor/m5stack/iluminationLevel", valueStr);
+    Serial.print("Ilumination: ");
+    Serial.println(ilumLevel);
 
     client.loop();
 }
@@ -274,18 +306,79 @@ void readCurrentBit() {
     }
 }
 
+void readCO2(){
+    co2Level = co2Sensor.getCO2();
+    Serial.print("CO2: ");
+    Serial.println(co2Level);
+}
+
+
+void readTVOC(){
+    if (!(airSensor.IAQmeasure() && airSensor.IAQmeasureRaw())) {
+        Serial.println("SGP30 read failed");
+    }else{
+        Serial.println("SGP30 read ok");
+        Serial.print("Raw Ethanol: ");
+        airQData.ethanol = airSensor.rawEthanol;
+        Serial.println(airQData.ethanol);
+
+        Serial.print("Raw H2: ");
+        airQData.hydrogen=airSensor.rawH2;
+        Serial.println(airQData.hydrogen);
+
+        Serial.print("eCo2: ");
+        airQData.eCo2 = airSensor.eCO2;
+        Serial.println(airQData.eCo2);
+   }
+}
+
+volatile double tslPulsesCount=0;
+void tsl_handler(){
+  tslPulsesCount++;
+}
+
+void readTSL(){
+  tslPulsesCount=0;
+  double startTime=micros();
+  attachInterrupt(G5, tsl_handler, RISING);
+  while((micros()-startTime)<TSL_MEASURMENT_PERIOD_US);
+  detachInterrupt(G5);
+  double durationSec = (micros()-startTime)/TSL_MEASURMENT_PERIOD_US;
+  ilumLevel =  tslPulsesCount/durationSec; //hz = mW/cm^2
+}
+
+
 void setup() {
     M5.begin();
+
     Serial.begin(OUT_BAUD);
     Serial2.begin(SENSOR_BAUD, SERIAL_8N1, 16, 17);
-
+    header("Sensors Init...", TFT_BLACK);
     pinMode(13, OUTPUT);
     digitalWrite(13, HIGH);
+    //pinMode(10, OUTPUT);
+    //digitalWrite(10, 1);
 
-    // Initialize SHT20 sensor
+    //Init CO2 sensor
+    Wire.begin(); //Start the wire hardware that may be supported by your platform
+    if (co2Sensor.begin(Wire) == false) //Pass the Wire port to the .begin() function
+    {
+        Serial.println("SCD30(NDIR) not detected. Please check wiring. Freezing...");
+        while (1);
+    }
+
+    // Initialize SHT20 temp/hum sensor
     sht20.initSHT20();
     delay(100);
     sht20.checkSHT20();
+
+    //Initialize SGP30 Eco2 sensor
+    airSensor.begin();
+    airSensor.IAQinit();
+    //TSL235
+    pinMode(G5, INPUT);
+    digitalWrite(G5, HIGH);
+    
 
     // Initialize display
     M5.Lcd.fillScreen(TFT_BLACK);
@@ -293,6 +386,7 @@ void setup() {
     setup_wifi();
     resetSerial();
     header("Environmental sensor", TFT_BLACK);
+ 
 }
 
 void loop() {
@@ -303,12 +397,16 @@ void loop() {
     if (currentByte >= DATA_LEN) {
         if (verifyChecksum(serial_bytes, DATA_LEN)) {
             readPMData();
-            displayPMandParticleValues();
-            readTempHumidity();
-            sendMQTTData();
+          
         } else {
             Serial.println("Checksum error");
         }
+        displayPMandParticleValues();
+        readTempHumidity();
+        readCO2();
+        readTVOC();
+        readTSL();
+        sendMQTTData();
         resetSerial();
     }
 }
